@@ -238,6 +238,10 @@ func handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"任务不存在"}`, 404)
 		return
 	}
+		if task.Status == "paused" {
+		http.Error(w, `{"error":"任务已暂停"}`, 400)
+		return
+	}
 	userID, _ := strconv.Atoi(r.Header.Get("X-User-ID"))
 	if task.UserID != userID {
 		http.Error(w, `{"error":"无权操作"}`, 403)
@@ -267,6 +271,49 @@ func handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 	taskManager.Set(task)
 	
 	jsonResponse(w, map[string]interface{}{"uploaded": 1, "total": 1, "progress": 100})
+}
+func handleUploadPause(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		TaskID string `json:"task_id"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+	task := taskManager.Get(req.TaskID)
+	if task == nil {
+		http.Error(w, `{"error":"任务不存在"}`, 404)
+		return
+	}
+	
+	task.Status = "paused"
+	task.UpdatedAt = time.Now().Unix()
+	taskManager.Set(task)
+	
+	jsonResponse(w, map[string]interface{}{"task_id": task.ID, "status": "paused"})
+}
+
+func handleUploadResume(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		TaskID string `json:"task_id"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+	task := taskManager.Get(req.TaskID)
+	if task == nil {
+		http.Error(w, `{"error":"任务不存在"}`, 404)
+		return
+	}
+	
+	task.Status = "uploading"
+	task.UpdatedAt = time.Now().Unix()
+	taskManager.Set(task)
+	
+	jsonResponse(w, map[string]interface{}{"task_id": task.ID, "status": "uploading"})
 }
 
 func handleUploadComplete(w http.ResponseWriter, r *http.Request) {
@@ -366,6 +413,8 @@ func main() {
 	http.HandleFunc("/api/upload/status/", corsMiddleware(authMiddleware(handleUploadStatus)))
 	http.HandleFunc("/api/upload/tasks", corsMiddleware(authMiddleware(handleUploadTasks)))
 	http.HandleFunc("/api/upload/cancel/", corsMiddleware(authMiddleware(handleUploadCancel)))
+	http.HandleFunc("/api/upload/pause", corsMiddleware(authMiddleware(handleUploadPause)))
+	http.HandleFunc("/api/upload/resume", corsMiddleware(authMiddleware(handleUploadResume)))
 
 	http.ListenAndServe(":8080", nil)
 }
