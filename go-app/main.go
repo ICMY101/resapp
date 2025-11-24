@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -25,12 +24,15 @@ var db *sql.DB
 var jwtSecret = []byte("your-secret-key-change-in-production")
 var uploadDir = "./uploads"
 var chunkDir = "./chunks"
+var concurrentChunks = 2
+
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
 	}
 	return defaultValue
 }
+
 type UploadTask struct {
 	ID          string `json:"id"`
 	UserID      int    `json:"user_id"`
@@ -74,9 +76,7 @@ func (tm *TaskManager) Set(task *UploadTask) {
 		string(uploadedJSON), task.Status, task.Progress, task.Description, task.FilePath, task.Category, task.ResourceID, task.Error, task.CreatedAt, task.UpdatedAt,
 		string(uploadedJSON), task.Status, task.Progress, task.FilePath, task.Category, task.ResourceID, task.Error, task.UpdatedAt)
 	if err != nil {
-		log.Printf("[错误] 保存任务 %s 失败: %v", task.ID, err)
-	} else {
-		log.Printf("[信息] 任务 %s 已保存: 状态=%s, 进度=%d%%", task.ID, task.Status, task.Progress)
+		// 日志输出已移除
 	}
 }
 
@@ -84,12 +84,7 @@ func (tm *TaskManager) Delete(id string) {
 	tm.Lock()
 	defer tm.Unlock()
 	delete(tm.tasks, id)
-	_, err := db.Exec("DELETE FROM upload_tasks WHERE id=?", id)
-	if err != nil {
-		log.Printf("[错误] 删除任务 %s 失败: %v", id, err)
-	} else {
-		log.Printf("[信息] 任务 %s 已删除", id)
-	}
+	db.Exec("DELETE FROM upload_tasks WHERE id=?", id)
 }
 
 func (tm *TaskManager) GetUserTasks(userID int) []*UploadTask {
@@ -101,7 +96,6 @@ func (tm *TaskManager) GetUserTasks(userID int) []*UploadTask {
 			result = append(result, t)
 		}
 	}
-	log.Printf("[信息] 用户 %d 有 %d 个活跃任务", userID, len(result))
 	return result
 }
 
@@ -109,30 +103,24 @@ func (tm *TaskManager) loadTasks() {
 	rows, err := db.Query(`SELECT id,user_id,file_name,file_size,chunk_size,total_chunks,uploaded,status,progress,description,file_path,category,resource_id,error,created_at,updated_at 
 		FROM upload_tasks WHERE status NOT IN ('completed','failed') OR updated_at > ?`, time.Now().Add(-24*time.Hour).Unix())
 	if err != nil {
-		log.Printf("[错误] 加载任务失败: %v", err)
 		return
 	}
 	defer rows.Close()
 	
-	count := 0
 	for rows.Next() {
 		var t UploadTask
 		var uploadedJSON string
 		err := rows.Scan(&t.ID, &t.UserID, &t.FileName, &t.FileSize, &t.ChunkSize, &t.TotalChunks, &uploadedJSON, &t.Status, &t.Progress, &t.Description, &t.FilePath, &t.Category, &t.ResourceID, &t.Error, &t.CreatedAt, &t.UpdatedAt)
 		if err != nil {
-			log.Printf("[错误] 扫描任务失败: %v", err)
 			continue
 		}
 		json.Unmarshal([]byte(uploadedJSON), &t.Uploaded)
 		tm.tasks[t.ID] = &t
-		count++
 		
 		if t.Status == "merging" || t.Status == "processing" {
-			log.Printf("[信息] 恢复任务 %s (状态=%s)", t.ID, t.Status)
 			go tm.processTask(&t)
 		}
 	}
-	log.Printf("[信息] 从数据库加载了 %d 个任务", count)
 }
 
 func (tm *TaskManager) processTask(task *UploadTask) {
@@ -144,7 +132,6 @@ func (tm *TaskManager) processTask(task *UploadTask) {
 }
 
 func (tm *TaskManager) mergeChunks(task *UploadTask) {
-	log.Printf("[信息] 开始合并任务 %s (%s)", task.ID, task.FileName)
 	task.Status = "merging"
 	task.UpdatedAt = time.Now().Unix()
 	tm.Set(task)
@@ -155,34 +142,59 @@ func (tm *TaskManager) mergeChunks(task *UploadTask) {
 
 	dst, err := os.Create(filePath)
 	if err != nil {
-		log.Printf("[错误] 创建输出文件失败，任务 %s: %v", task.ID, err)
 		task.Status, task.Error = "failed", "创建文件失败"
 		tm.Set(task)
 		return
 	}
 
+	sem := make(chan struct{}, concurrentChunks)
+	var wg sync.WaitGroup
+	var mergeErr error
+	var mu sync.Mutex
+
 	for i := 0; i < task.TotalChunks; i++ {
-		chunkPath := filepath.Join(chunkDir, task.ID, fmt.Sprintf("%d", i))
-		data, err := os.ReadFile(chunkPath)
-		if err != nil {
-			dst.Close()
-			os.Remove(filePath)
-			log.Printf("[错误] 读取分块 %d 失败，任务 %s: %v", i, task.ID, err)
-			task.Status, task.Error = "failed", fmt.Sprintf("读取分块%d失败", i)
-			tm.Set(task)
-			return
-		}
-		dst.Write(data)
-		task.Progress = 50 + (i+1)*25/task.TotalChunks
-		tm.Set(task)
+		wg.Add(1)
+		sem <- struct{}{}
 		
-		if i == task.TotalChunks-1 {
-			log.Printf("[信息] 任务 %s 合并完成: %d/%d 分块", task.ID, i+1, task.TotalChunks)
-		}
+		go func(chunkIndex int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			mu.Lock()
+			if mergeErr != nil {
+				mu.Unlock()
+				return
+			}
+			mu.Unlock()
+
+			chunkPath := filepath.Join(chunkDir, task.ID, fmt.Sprintf("%d", chunkIndex))
+			data, err := os.ReadFile(chunkPath)
+			if err != nil {
+				mu.Lock()
+				mergeErr = err
+				mu.Unlock()
+				return
+			}
+
+			mu.Lock()
+			dst.Write(data)
+			task.Progress = 50 + (chunkIndex+1)*25/task.TotalChunks
+			tm.Set(task)
+			mu.Unlock()
+		}(i)
 	}
+
+	wg.Wait()
 	dst.Close()
+
+	if mergeErr != nil {
+		os.Remove(filePath)
+		task.Status, task.Error = "failed", "合并分块失败"
+		tm.Set(task)
+		return
+	}
+
 	os.RemoveAll(filepath.Join(chunkDir, task.ID))
-	log.Printf("[信息] 任务 %s 合并成功", task.ID)
 
 	task.FilePath = filePath
 	task.Status = "processing"
@@ -192,7 +204,6 @@ func (tm *TaskManager) mergeChunks(task *UploadTask) {
 }
 
 func (tm *TaskManager) finalizeFile(task *UploadTask) {
-	log.Printf("[信息] 完成文件处理，任务 %s (%s)", task.ID, task.FileName)
 	ext := filepath.Ext(task.FileName)
 	fileType := getFileType(ext)
 	task.Category = getCategoryFromFileType(fileType)
@@ -205,7 +216,6 @@ func (tm *TaskManager) finalizeFile(task *UploadTask) {
 		filepath.Base(task.FilePath), task.FileName, info.Size(), task.Category, task.Description, task.FilePath, fileType, task.UserID)
 	if err != nil {
 		os.Remove(task.FilePath)
-		log.Printf("[错误] 保存资源失败，任务 %s: %v", task.ID, err)
 		task.Status, task.Error = "failed", "数据库写入失败"
 		tm.Set(task)
 		return
@@ -215,7 +225,6 @@ func (tm *TaskManager) finalizeFile(task *UploadTask) {
 	task.Status, task.Progress = "completed", 100
 	task.UpdatedAt = time.Now().Unix()
 	tm.Set(task)
-	log.Printf("[成功] 任务 %s 完成，资源 ID: %d，大小: %d 字节", task.ID, task.ResourceID, info.Size())
 }
 
 func handleUploadInit(w http.ResponseWriter, r *http.Request) {
@@ -241,14 +250,10 @@ func handleUploadInit(w http.ResponseWriter, r *http.Request) {
 	os.MkdirAll(filepath.Join(chunkDir, task.ID), 0755)
 	taskManager.Set(task)
 	
-	log.Printf("[信息] 上传初始化: 任务ID=%s, 用户=%d, 文件=%s, 大小=%d, 总分块数=%d", 
-		task.ID, userID, req.FileName, req.FileSize, totalChunks)
-	
 	jsonResponse(w, map[string]interface{}{"task_id": task.ID, "chunk_size": req.ChunkSize, "total_chunks": totalChunks})
 }
 
 func handleUploadChunk(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
 	if r.Method != "POST" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -263,7 +268,6 @@ func handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 	}
 	userID, _ := strconv.Atoi(r.Header.Get("X-User-ID"))
 	if task.UserID != userID {
-		log.Printf("[警告] 未授权的分块上传尝试: 任务=%s, 用户=%d", taskID, userID)
 		http.Error(w, `{"error":"无权操作"}`, 403)
 		return
 	}
@@ -275,7 +279,6 @@ func handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 	}
 	file, _, err := r.FormFile("chunk")
 	if err != nil {
-		log.Printf("[错误] 读取分块 %d 失败，任务 %s: %v", chunkIdx, taskID, err)
 		http.Error(w, `{"error":"读取分块失败"}`, 400)
 		return
 	}
@@ -289,12 +292,6 @@ func handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 	task.Progress = len(task.Uploaded) * 50 / task.TotalChunks
 	task.UpdatedAt = time.Now().Unix()
 	taskManager.Set(task)
-	
-	elapsed := time.Since(start)
-	if chunkIdx == task.TotalChunks-1 {
-		log.Printf("[信息] 分块上传完成: 任务=%s, 分块=%d/%d, 大小=%d 字节, 耗时=%v, 进度=%d%%", 
-			taskID, len(task.Uploaded), task.TotalChunks, written, elapsed, task.Progress)
-	}
 	
 	jsonResponse(w, map[string]interface{}{"uploaded": len(task.Uploaded), "total": task.TotalChunks, "progress": task.Progress})
 }
@@ -314,12 +311,10 @@ func handleUploadComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(task.Uploaded) != task.TotalChunks {
-		log.Printf("[警告] 上传不完整: 任务=%s, 已上传=%d, 应有=%d", req.TaskID, len(task.Uploaded), task.TotalChunks)
 		http.Error(w, `{"error":"分块不完整"}`, 400)
 		return
 	}
 	
-	log.Printf("[信息] 上传完成信号，任务 %s，开始合并", req.TaskID)
 	jsonResponse(w, map[string]interface{}{"task_id": task.ID, "status": "merging"})
 	go taskManager.mergeChunks(task)
 }
@@ -354,7 +349,6 @@ func handleUploadCancel(w http.ResponseWriter, r *http.Request) {
 		jsonResponse(w, map[string]string{"message": "任务不存在"})
 		return
 	}
-	log.Printf("[信息] 取消任务 %s (%s)", taskID, task.FileName)
 	os.RemoveAll(filepath.Join(chunkDir, taskID))
 	if task.FilePath != "" {
 		os.Remove(task.FilePath)
@@ -371,12 +365,10 @@ type User struct {
 }
 
 func main() {
-	log.Println("[初始化] 启动资源共享服务器...")
 	initDB()
 	defer db.Close()
 	os.MkdirAll(uploadDir, 0755)
 	os.MkdirAll(chunkDir, 0755)
-	log.Println("[初始化] 加载现有上传任务...")
 	taskManager.loadTasks()
 
 	http.HandleFunc("/api/register", corsMiddleware(handleRegister))
@@ -400,13 +392,11 @@ func main() {
 	http.HandleFunc("/api/upload/tasks", corsMiddleware(authMiddleware(handleUploadTasks)))
 	http.HandleFunc("/api/upload/cancel/", corsMiddleware(authMiddleware(handleUploadCancel)))
 
-	log.Println("[就绪] 服务器监听在 :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	http.ListenAndServe(":8080", nil)
 }
 
 func initDB() {
 	var err error
-	// 从环境变量获取数据库配置
 	dbHost := getEnv("DB_HOST", "mysql")
 	dbPort := getEnv("DB_PORT", "3306")
 	dbUser := getEnv("DB_USER", "root")
@@ -418,19 +408,13 @@ func initDB() {
 	
 	db, err = sql.Open("mysql", dsn)
 	if err != nil {
-		log.Fatal("[致命错误] 数据库连接失败:", err)
+		os.Exit(1)
 	}
-	log.Println("[信息] 数据库连接成功")
 	
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS upload_tasks (
+	db.Exec(`CREATE TABLE IF NOT EXISTS upload_tasks (
 		id VARCHAR(64) PRIMARY KEY, user_id INT, file_name VARCHAR(255), file_size BIGINT, chunk_size BIGINT, total_chunks INT,
 		uploaded TEXT, status VARCHAR(20) DEFAULT 'pending', progress INT DEFAULT 0, description TEXT, file_path VARCHAR(512),
 		category VARCHAR(50), resource_id BIGINT, error TEXT, created_at BIGINT, updated_at BIGINT, INDEX(user_id), INDEX(status))`)
-	if err != nil {
-		log.Printf("[警告] 创建 upload_tasks 表失败: %v", err)
-	} else {
-		log.Println("[信息] 数据库表验证完成")
-	}
 }
 
 func hashPassword(p string) string {
@@ -508,11 +492,9 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	_, err := db.Exec("INSERT INTO users (username,password) VALUES (?,?)", req.Username, hashPassword(req.Password))
 	if err != nil {
-		log.Printf("[警告] 用户 '%s' 注册失败: %v", req.Username, err)
 		http.Error(w, `{"error":"用户名已存在"}`, 400)
 		return
 	}
-	log.Printf("[信息] 新用户注册: %s", req.Username)
 	jsonResponse(w, map[string]string{"message": "注册成功"})
 }
 
@@ -525,12 +507,10 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	var u User
 	err := db.QueryRow("SELECT id,username,role FROM users WHERE username=? AND password=?", req.Username, hashPassword(req.Password)).Scan(&u.ID, &u.Username, &u.Role)
 	if err != nil {
-		log.Printf("[警告] 用户 '%s' 登录失败", req.Username)
 		http.Error(w, `{"error":"用户名或密码错误"}`, 401)
 		return
 	}
 	token, _ := generateToken(u.ID, u.Role)
-	log.Printf("[信息] 用户登录: %s (ID: %d, 角色: %s)", u.Username, u.ID, u.Role)
 	jsonResponse(w, map[string]interface{}{"token": token, "user": u})
 }
 
@@ -551,7 +531,6 @@ func handleUsers(w http.ResponseWriter, r *http.Request) {
 			rows.Scan(&u.ID, &u.Username, &u.Role, &u.Created)
 			users = append(users, u)
 		}
-		log.Printf("[信息] 列出 %d 个用户", len(users))
 		jsonResponse(w, users)
 	} else if r.Method == "POST" {
 		var req struct{ Username, Password, Role string }
@@ -560,7 +539,6 @@ func handleUsers(w http.ResponseWriter, r *http.Request) {
 			req.Role = "user"
 		}
 		db.Exec("INSERT INTO users (username,password,role) VALUES (?,?,?)", req.Username, hashPassword(req.Password), req.Role)
-		log.Printf("[信息] 用户创建: %s (角色: %s)", req.Username, req.Role)
 		jsonResponse(w, map[string]string{"message": "创建成功"})
 	}
 }
@@ -575,11 +553,9 @@ func handleUserOps(w http.ResponseWriter, r *http.Request) {
 		} else {
 			db.Exec("UPDATE users SET username=?,role=? WHERE id=?", req.Username, req.Role, id)
 		}
-		log.Printf("[信息] 用户 %s 已更新", id)
 		jsonResponse(w, map[string]string{"message": "更新成功"})
 	} else if r.Method == "DELETE" {
 		db.Exec("DELETE FROM users WHERE id=? AND id!=1", id)
-		log.Printf("[信息] 用户 %s 已删除", id)
 		jsonResponse(w, map[string]string{"message": "删除成功"})
 	}
 }
@@ -641,7 +617,6 @@ func handleResourceOps(w http.ResponseWriter, r *http.Request) {
 		var size int64
 		err := db.QueryRow(`SELECT r.id,r.name,r.orig_name,r.size,r.category,r.description,r.file_type,COALESCE(u.username,''),r.downloads,r.created_at,r.file_path FROM resources r LEFT JOIN users u ON r.uploader_id=u.id WHERE r.id=?`, id).Scan(&rid, &name, &origName, &size, &cat, &desc, &ft, &uploader, &downloads, &created, &fp)
 		if err != nil {
-			log.Printf("[警告] 资源 %s 不存在", id)
 			http.Error(w, `{"error":"资源不存在"}`, 404)
 			return
 		}
@@ -651,10 +626,9 @@ func handleResourceOps(w http.ResponseWriter, r *http.Request) {
 			"created": created, "preview": getPreviewType(ft),
 		})
 	}  else if r.Method == "PUT" {
-			var req struct{ Description string }  // 只接收描述字段
+			var req struct{ Description string }
 			json.NewDecoder(r.Body).Decode(&req)
-			db.Exec("UPDATE resources SET description=? WHERE id=?", req.Description, id)  // 只更新描述
-			log.Printf("[信息] 资源 %s 描述已更新", id)
+			db.Exec("UPDATE resources SET description=? WHERE id=?", req.Description, id)
 			jsonResponse(w, map[string]string{"message": "更新成功"})
 		} else if r.Method == "DELETE" {
 		var fp string
@@ -663,7 +637,6 @@ func handleResourceOps(w http.ResponseWriter, r *http.Request) {
 			os.Remove(fp)
 		}
 		db.Exec("DELETE FROM resources WHERE id=?", id)
-		log.Printf("[信息] 资源 %s 已删除", id)
 		jsonResponse(w, map[string]string{"message": "删除成功"})
 	}
 }
@@ -675,7 +648,6 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	r.ParseMultipartForm(32 << 20)
 	file, header, err := r.FormFile("file")
 	if err != nil {
-		log.Printf("[错误] 上传失败: %v", err)
 		http.Error(w, `{"error":"上传失败"}`, 400)
 		return
 	}
@@ -692,7 +664,6 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	res, _ := db.Exec(`INSERT INTO resources (name,orig_name,size,category,description,file_path,file_type,uploader_id) VALUES (?,?,?,?,?,?,?,?)`,
 		newName, header.Filename, written, cat, r.FormValue("description"), filePath, ft, uid)
 	id, _ := res.LastInsertId()
-	log.Printf("[信息] 直接上传完成: 资源ID=%d, 用户=%d, 文件=%s, 大小=%d 字节", id, uid, header.Filename, written)
 	jsonResponse(w, map[string]interface{}{"id": id, "category": cat})
 }
 
@@ -701,12 +672,10 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 	var fp, origName string
 	err := db.QueryRow("SELECT file_path,orig_name FROM resources WHERE id=?", id).Scan(&fp, &origName)
 	if err != nil || fp == "" {
-		log.Printf("[警告] 下载失败: 资源 %s 不存在", id)
 		http.Error(w, "Not found", 404)
 		return
 	}
 	db.Exec("UPDATE resources SET downloads=downloads+1 WHERE id=?", id)
-	log.Printf("[信息] 资源 %s 已下载: %s", id, origName)
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, origName))
 	http.ServeFile(w, r, fp)
 }
@@ -757,7 +726,6 @@ func handleAnnouncements(w http.ResponseWriter, r *http.Request) {
 		var req struct{ Title, Content string }
 		json.NewDecoder(r.Body).Decode(&req)
 		db.Exec("INSERT INTO announcements (title,content) VALUES (?,?)", req.Title, req.Content)
-		log.Printf("[信息] 公告创建: %s", req.Title)
 		jsonResponse(w, map[string]string{"message": "发布成功"})
 	}
 }
@@ -766,7 +734,6 @@ func handleAnnouncementOps(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/api/announcements/")
 	if r.Method == "DELETE" {
 		db.Exec("DELETE FROM announcements WHERE id=?", id)
-		log.Printf("[信息] 公告 %s 已删除", id)
 		jsonResponse(w, map[string]string{"message": "删除成功"})
 	}
 }
