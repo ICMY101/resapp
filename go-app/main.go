@@ -24,7 +24,7 @@ var db *sql.DB
 var jwtSecret = []byte("your-secret-key-change-in-production")
 var uploadDir = "./uploads"
 var chunkDir = "./chunks"
-var concurrentChunks = 2
+var concurrentChunks = 1  // 改为1块
 
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
@@ -147,52 +147,22 @@ func (tm *TaskManager) mergeChunks(task *UploadTask) {
 		return
 	}
 
-	sem := make(chan struct{}, concurrentChunks)
-	var wg sync.WaitGroup
-	var mergeErr error
-	var mu sync.Mutex
-
-	for i := 0; i < task.TotalChunks; i++ {
-		wg.Add(1)
-		sem <- struct{}{}
-		
-		go func(chunkIndex int) {
-			defer wg.Done()
-			defer func() { <-sem }()
-
-			mu.Lock()
-			if mergeErr != nil {
-				mu.Unlock()
-				return
-			}
-			mu.Unlock()
-
-			chunkPath := filepath.Join(chunkDir, task.ID, fmt.Sprintf("%d", chunkIndex))
-			data, err := os.ReadFile(chunkPath)
-			if err != nil {
-				mu.Lock()
-				mergeErr = err
-				mu.Unlock()
-				return
-			}
-
-			mu.Lock()
-			dst.Write(data)
-			task.Progress = 50 + (chunkIndex+1)*25/task.TotalChunks
-			tm.Set(task)
-			mu.Unlock()
-		}(i)
-	}
-
-	wg.Wait()
-	dst.Close()
-
-	if mergeErr != nil {
+	// 简化合并逻辑，因为只有1块
+	chunkPath := filepath.Join(chunkDir, task.ID, "0")
+	data, err := os.ReadFile(chunkPath)
+	if err != nil {
+		dst.Close()
 		os.Remove(filePath)
-		task.Status, task.Error = "failed", "合并分块失败"
+		task.Status, task.Error = "failed", "读取分块失败"
 		tm.Set(task)
 		return
 	}
+	
+	dst.Write(data)
+	dst.Close()
+	
+	task.Progress = 75
+	tm.Set(task)
 
 	os.RemoveAll(filepath.Join(chunkDir, task.ID))
 
@@ -240,17 +210,19 @@ func handleUploadInit(w http.ResponseWriter, r *http.Request) {
 	}
 	json.NewDecoder(r.Body).Decode(&req)
 	userID, _ := strconv.Atoi(r.Header.Get("X-User-ID"))
-	totalChunks := int((req.FileSize + req.ChunkSize - 1) / req.ChunkSize)
+	
+	// 强制设置为1块
+	totalChunks := 1
 
 	task := &UploadTask{
 		ID: uuid.New().String(), UserID: userID, FileName: req.FileName, FileSize: req.FileSize,
-		ChunkSize: req.ChunkSize, TotalChunks: totalChunks, Uploaded: []int{}, Status: "pending",
+		ChunkSize: req.FileSize, TotalChunks: totalChunks, Uploaded: []int{}, Status: "pending",  // ChunkSize 设为文件大小
 		Description: req.Description, CreatedAt: time.Now().Unix(), UpdatedAt: time.Now().Unix(),
 	}
 	os.MkdirAll(filepath.Join(chunkDir, task.ID), 0755)
 	taskManager.Set(task)
 	
-	jsonResponse(w, map[string]interface{}{"task_id": task.ID, "chunk_size": req.ChunkSize, "total_chunks": totalChunks})
+	jsonResponse(w, map[string]interface{}{"task_id": task.ID, "chunk_size": req.FileSize, "total_chunks": totalChunks})
 }
 
 func handleUploadChunk(w http.ResponseWriter, r *http.Request) {
@@ -271,29 +243,30 @@ func handleUploadChunk(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"无权操作"}`, 403)
 		return
 	}
-	for _, idx := range task.Uploaded {
-		if idx == chunkIdx {
-			jsonResponse(w, map[string]interface{}{"uploaded": len(task.Uploaded), "total": task.TotalChunks})
-			return
-		}
+	
+	// 检查是否已上传
+	if len(task.Uploaded) > 0 {
+		jsonResponse(w, map[string]interface{}{"uploaded": len(task.Uploaded), "total": task.TotalChunks})
+		return
 	}
+	
 	file, _, err := r.FormFile("chunk")
 	if err != nil {
 		http.Error(w, `{"error":"读取分块失败"}`, 400)
 		return
 	}
 	defer file.Close()
-	dst, _ := os.Create(filepath.Join(chunkDir, taskID, fmt.Sprintf("%d", chunkIdx)))
+	dst, _ := os.Create(filepath.Join(chunkDir, taskID, "0"))  // 固定为0号分块
 	written, _ := io.Copy(dst, file)
 	dst.Close()
 
-	task.Uploaded = append(task.Uploaded, chunkIdx)
+	task.Uploaded = []int{0}  // 只记录0号分块
 	task.Status = "uploading"
-	task.Progress = len(task.Uploaded) * 50 / task.TotalChunks
+	task.Progress = 100  // 上传完成直接100%
 	task.UpdatedAt = time.Now().Unix()
 	taskManager.Set(task)
 	
-	jsonResponse(w, map[string]interface{}{"uploaded": len(task.Uploaded), "total": task.TotalChunks, "progress": task.Progress})
+	jsonResponse(w, map[string]interface{}{"uploaded": 1, "total": 1, "progress": 100})
 }
 
 func handleUploadComplete(w http.ResponseWriter, r *http.Request) {
@@ -310,7 +283,9 @@ func handleUploadComplete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"任务不存在"}`, 404)
 		return
 	}
-	if len(task.Uploaded) != task.TotalChunks {
+	
+	// 检查是否已上传（只有1块）
+	if len(task.Uploaded) != 1 {
 		http.Error(w, `{"error":"分块不完整"}`, 400)
 		return
 	}
