@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -23,8 +22,6 @@ import (
 var db *sql.DB
 var jwtSecret = []byte("your-secret-key-change-in-production")
 var uploadDir = "./uploads"
-var chunkDir = "./chunks"
-var concurrentChunks = 1  // 改为1块
 
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
@@ -33,365 +30,10 @@ func getEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
-type UploadTask struct {
-	ID          string `json:"id"`
-	UserID      int    `json:"user_id"`
-	FileName    string `json:"file_name"`
-	FileSize    int64  `json:"file_size"`
-	ChunkSize   int64  `json:"chunk_size"`
-	TotalChunks int    `json:"total_chunks"`
-	Uploaded    []int  `json:"uploaded"`
-	Status      string `json:"status"`
-	Progress    int    `json:"progress"`
-	Description string `json:"description"`
-	FilePath    string `json:"file_path"`
-	Category    string `json:"category"`
-	ResourceID  int64  `json:"resource_id"`
-	Error       string `json:"error"`
-	CreatedAt   int64  `json:"created_at"`
-	UpdatedAt   int64  `json:"updated_at"`
-}
-
-type TaskManager struct {
-	sync.RWMutex
-	tasks map[string]*UploadTask
-}
-
-var taskManager = &TaskManager{tasks: make(map[string]*UploadTask)}
-
-func (tm *TaskManager) Get(id string) *UploadTask {
-	tm.RLock()
-	defer tm.RUnlock()
-	return tm.tasks[id]
-}
-
-func (tm *TaskManager) Set(task *UploadTask) {
-	tm.Lock()
-	defer tm.Unlock()
-	tm.tasks[task.ID] = task
-	uploadedJSON, _ := json.Marshal(task.Uploaded)
-	_, err := db.Exec(`INSERT INTO upload_tasks (id,user_id,file_name,file_size,chunk_size,total_chunks,uploaded,status,progress,description,file_path,category,resource_id,error,created_at,updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE uploaded=?,status=?,progress=?,file_path=?,category=?,resource_id=?,error=?,updated_at=?`,
-		task.ID, task.UserID, task.FileName, task.FileSize, task.ChunkSize, task.TotalChunks,
-		string(uploadedJSON), task.Status, task.Progress, task.Description, task.FilePath, task.Category, task.ResourceID, task.Error, task.CreatedAt, task.UpdatedAt,
-		string(uploadedJSON), task.Status, task.Progress, task.FilePath, task.Category, task.ResourceID, task.Error, task.UpdatedAt)
-	if err != nil {
-		// 日志输出已移除
-	}
-}
-
-func (tm *TaskManager) Delete(id string) {
-	tm.Lock()
-	defer tm.Unlock()
-	delete(tm.tasks, id)
-	db.Exec("DELETE FROM upload_tasks WHERE id=?", id)
-}
-
-func (tm *TaskManager) GetUserTasks(userID int) []*UploadTask {
-	tm.RLock()
-	defer tm.RUnlock()
-	var result []*UploadTask
-	for _, t := range tm.tasks {
-		if t.UserID == userID {
-			result = append(result, t)
-		}
-	}
-	return result
-}
-
-func (tm *TaskManager) loadTasks() {
-	rows, err := db.Query(`SELECT id,user_id,file_name,file_size,chunk_size,total_chunks,uploaded,status,progress,description,file_path,category,resource_id,error,created_at,updated_at 
-		FROM upload_tasks WHERE status NOT IN ('completed','failed') OR updated_at > ?`, time.Now().Add(-24*time.Hour).Unix())
-	if err != nil {
-		return
-	}
-	defer rows.Close()
-	
-	for rows.Next() {
-		var t UploadTask
-		var uploadedJSON string
-		err := rows.Scan(&t.ID, &t.UserID, &t.FileName, &t.FileSize, &t.ChunkSize, &t.TotalChunks, &uploadedJSON, &t.Status, &t.Progress, &t.Description, &t.FilePath, &t.Category, &t.ResourceID, &t.Error, &t.CreatedAt, &t.UpdatedAt)
-		if err != nil {
-			continue
-		}
-		json.Unmarshal([]byte(uploadedJSON), &t.Uploaded)
-		tm.tasks[t.ID] = &t
-		
-		if t.Status == "merging" || t.Status == "processing" {
-			go tm.processTask(&t)
-		}
-	}
-}
-
-func (tm *TaskManager) processTask(task *UploadTask) {
-	if task.Status == "merging" {
-		tm.mergeChunks(task)
-	} else {
-		tm.finalizeFile(task)
-	}
-}
-
-func (tm *TaskManager) mergeChunks(task *UploadTask) {
-	task.Status = "merging"
-	task.UpdatedAt = time.Now().Unix()
-	tm.Set(task)
-
-	ext := filepath.Ext(task.FileName)
-	newName := uuid.New().String() + ext
-	filePath := filepath.Join(uploadDir, newName)
-
-	dst, err := os.Create(filePath)
-	if err != nil {
-		task.Status, task.Error = "failed", "创建文件失败"
-		tm.Set(task)
-		return
-	}
-
-	// 简化合并逻辑，因为只有1块
-	chunkPath := filepath.Join(chunkDir, task.ID, "0")
-	data, err := os.ReadFile(chunkPath)
-	if err != nil {
-		dst.Close()
-		os.Remove(filePath)
-		task.Status, task.Error = "failed", "读取分块失败"
-		tm.Set(task)
-		return
-	}
-	
-	dst.Write(data)
-	dst.Close()
-	
-	task.Progress = 75
-	tm.Set(task)
-
-	os.RemoveAll(filepath.Join(chunkDir, task.ID))
-
-	task.FilePath = filePath
-	task.Status = "processing"
-	task.Progress = 75
-	tm.Set(task)
-	tm.finalizeFile(task)
-}
-
-func (tm *TaskManager) finalizeFile(task *UploadTask) {
-	ext := filepath.Ext(task.FileName)
-	fileType := getFileType(ext)
-	task.Category = getCategoryFromFileType(fileType)
-
-	info, _ := os.Stat(task.FilePath)
-	task.Progress = 90
-	tm.Set(task)
-
-	res, err := db.Exec(`INSERT INTO resources (name,orig_name,size,category,description,file_path,file_type,uploader_id) VALUES (?,?,?,?,?,?,?,?)`,
-		filepath.Base(task.FilePath), task.FileName, info.Size(), task.Category, task.Description, task.FilePath, fileType, task.UserID)
-	if err != nil {
-		os.Remove(task.FilePath)
-		task.Status, task.Error = "failed", "数据库写入失败"
-		tm.Set(task)
-		return
-	}
-
-	task.ResourceID, _ = res.LastInsertId()
-	task.Status, task.Progress = "completed", 100
-	task.UpdatedAt = time.Now().Unix()
-	tm.Set(task)
-}
-
-func handleUploadInit(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	var req struct {
-		FileName    string `json:"file_name"`
-		FileSize    int64  `json:"file_size"`
-		ChunkSize   int64  `json:"chunk_size"`
-		Description string `json:"description"`
-	}
-	json.NewDecoder(r.Body).Decode(&req)
-	userID, _ := strconv.Atoi(r.Header.Get("X-User-ID"))
-	
-	// 强制设置为1块
-	totalChunks := 1
-
-	task := &UploadTask{
-		ID: uuid.New().String(), UserID: userID, FileName: req.FileName, FileSize: req.FileSize,
-		ChunkSize: req.FileSize, TotalChunks: totalChunks, Uploaded: []int{}, Status: "pending",  // ChunkSize 设为文件大小
-		Description: req.Description, CreatedAt: time.Now().Unix(), UpdatedAt: time.Now().Unix(),
-	}
-	os.MkdirAll(filepath.Join(chunkDir, task.ID), 0755)
-	taskManager.Set(task)
-	
-	jsonResponse(w, map[string]interface{}{"task_id": task.ID, "chunk_size": req.FileSize, "total_chunks": totalChunks})
-}
-
-func handleUploadChunk(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	r.ParseMultipartForm(10 << 20)
-	taskID := r.FormValue("task_id")
-	chunkIdx, _ := strconv.Atoi(r.FormValue("chunk_index"))
-	task := taskManager.Get(taskID)
-	if task == nil {
-		http.Error(w, `{"error":"任务不存在"}`, 404)
-		return
-	}
-		if task.Status == "paused" {
-		http.Error(w, `{"error":"任务已暂停"}`, 400)
-		return
-	}
-	userID, _ := strconv.Atoi(r.Header.Get("X-User-ID"))
-	if task.UserID != userID {
-		http.Error(w, `{"error":"无权操作"}`, 403)
-		return
-	}
-	
-	// 检查是否已上传
-	if len(task.Uploaded) > 0 {
-		jsonResponse(w, map[string]interface{}{"uploaded": len(task.Uploaded), "total": task.TotalChunks})
-		return
-	}
-	
-	file, _, err := r.FormFile("chunk")
-	if err != nil {
-		http.Error(w, `{"error":"读取分块失败"}`, 400)
-		return
-	}
-	defer file.Close()
-	dst, _ := os.Create(filepath.Join(chunkDir, taskID, "0"))  // 固定为0号分块
-	written, _ := io.Copy(dst, file)
-	dst.Close()
-
-	task.Uploaded = []int{0}  // 只记录0号分块
-	task.Status = "uploading"
-	task.Progress = 100  // 上传完成直接100%
-	task.UpdatedAt = time.Now().Unix()
-	taskManager.Set(task)
-	
-	jsonResponse(w, map[string]interface{}{"uploaded": 1, "total": 1, "progress": 100})
-}
-func handleUploadPause(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	var req struct {
-		TaskID string `json:"task_id"`
-	}
-	json.NewDecoder(r.Body).Decode(&req)
-	task := taskManager.Get(req.TaskID)
-	if task == nil {
-		http.Error(w, `{"error":"任务不存在"}`, 404)
-		return
-	}
-	
-	task.Status = "paused"
-	task.UpdatedAt = time.Now().Unix()
-	taskManager.Set(task)
-	
-	jsonResponse(w, map[string]interface{}{"task_id": task.ID, "status": "paused"})
-}
-
-func handleUploadResume(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	var req struct {
-		TaskID string `json:"task_id"`
-	}
-	json.NewDecoder(r.Body).Decode(&req)
-	task := taskManager.Get(req.TaskID)
-	if task == nil {
-		http.Error(w, `{"error":"任务不存在"}`, 404)
-		return
-	}
-	
-	task.Status = "uploading"
-	task.UpdatedAt = time.Now().Unix()
-	taskManager.Set(task)
-	
-	jsonResponse(w, map[string]interface{}{"task_id": task.ID, "status": "uploading"})
-}
-
-func handleUploadComplete(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	var req struct {
-		TaskID string `json:"task_id"`
-	}
-	json.NewDecoder(r.Body).Decode(&req)
-	task := taskManager.Get(req.TaskID)
-	if task == nil {
-		http.Error(w, `{"error":"任务不存在"}`, 404)
-		return
-	}
-	
-	// 检查是否已上传（只有1块）
-	if len(task.Uploaded) != 1 {
-		http.Error(w, `{"error":"分块不完整"}`, 400)
-		return
-	}
-	
-	jsonResponse(w, map[string]interface{}{"task_id": task.ID, "status": "merging"})
-	go taskManager.mergeChunks(task)
-}
-
-func handleUploadStatus(w http.ResponseWriter, r *http.Request) {
-	taskID := strings.TrimPrefix(r.URL.Path, "/api/upload/status/")
-	task := taskManager.Get(taskID)
-	if task == nil {
-		http.Error(w, `{"error":"任务不存在"}`, 404)
-		return
-	}
-	jsonResponse(w, task)
-}
-
-func handleUploadTasks(w http.ResponseWriter, r *http.Request) {
-	userID, _ := strconv.Atoi(r.Header.Get("X-User-ID"))
-	tasks := taskManager.GetUserTasks(userID)
-	if tasks == nil {
-		tasks = []*UploadTask{}
-	}
-	jsonResponse(w, tasks)
-}
-
-func handleUploadCancel(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "DELETE" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	taskID := strings.TrimPrefix(r.URL.Path, "/api/upload/cancel/")
-	task := taskManager.Get(taskID)
-	if task == nil {
-		jsonResponse(w, map[string]string{"message": "任务不存在"})
-		return
-	}
-	os.RemoveAll(filepath.Join(chunkDir, taskID))
-	if task.FilePath != "" {
-		os.Remove(task.FilePath)
-	}
-	taskManager.Delete(taskID)
-	jsonResponse(w, map[string]string{"message": "已取消"})
-}
-
-type User struct {
-	ID       int    `json:"id"`
-	Username string `json:"username"`
-	Role     string `json:"role"`
-	Created  string `json:"created"`
-}
-
 func main() {
 	initDB()
 	defer db.Close()
 	os.MkdirAll(uploadDir, 0755)
-	os.MkdirAll(chunkDir, 0755)
-	taskManager.loadTasks()
 
 	http.HandleFunc("/api/register", corsMiddleware(handleRegister))
 	http.HandleFunc("/api/login", corsMiddleware(handleLogin))
@@ -407,14 +49,6 @@ func main() {
 	http.HandleFunc("/api/announcements", corsMiddleware(handleAnnouncements))
 	http.HandleFunc("/api/announcements/", corsMiddleware(adminMiddleware(handleAnnouncementOps)))
 	http.HandleFunc("/api/stats", corsMiddleware(handleStats))
-	http.HandleFunc("/api/upload/init", corsMiddleware(authMiddleware(handleUploadInit)))
-	http.HandleFunc("/api/upload/chunk", corsMiddleware(authMiddleware(handleUploadChunk)))
-	http.HandleFunc("/api/upload/complete", corsMiddleware(authMiddleware(handleUploadComplete)))
-	http.HandleFunc("/api/upload/status/", corsMiddleware(authMiddleware(handleUploadStatus)))
-	http.HandleFunc("/api/upload/tasks", corsMiddleware(authMiddleware(handleUploadTasks)))
-	http.HandleFunc("/api/upload/cancel/", corsMiddleware(authMiddleware(handleUploadCancel)))
-	http.HandleFunc("/api/upload/pause", corsMiddleware(authMiddleware(handleUploadPause)))
-	http.HandleFunc("/api/upload/resume", corsMiddleware(authMiddleware(handleUploadResume)))
 
 	http.ListenAndServe(":8080", nil)
 }
@@ -434,11 +68,6 @@ func initDB() {
 	if err != nil {
 		os.Exit(1)
 	}
-	
-	db.Exec(`CREATE TABLE IF NOT EXISTS upload_tasks (
-		id VARCHAR(64) PRIMARY KEY, user_id INT, file_name VARCHAR(255), file_size BIGINT, chunk_size BIGINT, total_chunks INT,
-		uploaded TEXT, status VARCHAR(20) DEFAULT 'pending', progress INT DEFAULT 0, description TEXT, file_path VARCHAR(512),
-		category VARCHAR(50), resource_id BIGINT, error TEXT, created_at BIGINT, updated_at BIGINT, INDEX(user_id), INDEX(status))`)
 }
 
 func hashPassword(p string) string {
@@ -669,26 +298,57 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		return
 	}
-	r.ParseMultipartForm(32 << 20)
+	
+	// 增加文件大小限制 (100MB)
+	r.ParseMultipartForm(100 << 20)
 	file, header, err := r.FormFile("file")
 	if err != nil {
-		http.Error(w, `{"error":"上传失败"}`, 400)
+		http.Error(w, `{"error":"读取文件失败"}`, 400)
 		return
 	}
 	defer file.Close()
+	
+	// 生成唯一文件名
 	ext := filepath.Ext(header.Filename)
 	newName := uuid.New().String() + ext
 	filePath := filepath.Join(uploadDir, newName)
-	dst, _ := os.Create(filePath)
+	
+	// 创建目标文件
+	dst, err := os.Create(filePath)
+	if err != nil {
+		http.Error(w, `{"error":"创建文件失败"}`, 500)
+		return
+	}
 	defer dst.Close()
-	written, _ := io.Copy(dst, file)
+	
+	// 复制文件内容
+	written, err := io.Copy(dst, file)
+	if err != nil {
+		os.Remove(filePath)
+		http.Error(w, `{"error":"保存文件失败"}`, 500)
+		return
+	}
+	
+	// 获取用户ID
 	uid, _ := strconv.Atoi(r.Header.Get("X-User-ID"))
+	
+	// 确定文件类型和分类
 	ft := getFileType(ext)
 	cat := getCategoryFromFileType(ft)
-	res, _ := db.Exec(`INSERT INTO resources (name,orig_name,size,category,description,file_path,file_type,uploader_id) VALUES (?,?,?,?,?,?,?,?)`,
-		newName, header.Filename, written, cat, r.FormValue("description"), filePath, ft, uid)
+	description := r.FormValue("description")
+	
+	// 保存到数据库
+	res, err := db.Exec(`INSERT INTO resources (name,orig_name,size,category,description,file_path,file_type,uploader_id) VALUES (?,?,?,?,?,?,?,?)`,
+		newName, header.Filename, written, cat, description, filePath, ft, uid)
+	
+	if err != nil {
+		os.Remove(filePath)
+		http.Error(w, `{"error":"数据库写入失败"}`, 500)
+		return
+	}
+	
 	id, _ := res.LastInsertId()
-	jsonResponse(w, map[string]interface{}{"id": id, "category": cat})
+	jsonResponse(w, map[string]interface{}{"id": id, "category": cat, "message": "上传成功"})
 }
 
 func handleDownload(w http.ResponseWriter, r *http.Request) {
@@ -815,4 +475,11 @@ func getPreviewType(ft string) string {
 	default:
 		return "none"
 	}
+}
+
+type User struct {
+	ID       int    `json:"id"`
+	Username string `json:"username"`
+	Role     string `json:"role"`
+	Created  string `json:"created"`
 }

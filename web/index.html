@@ -28,16 +28,7 @@ let token = localStorage.getItem('token'),
     categories = [],
     isLoginMode = true,
     editingUserId = null,
-    uploadTasks = {},
-    selectedFiles = [],
-    FIXED_CONCURRENCY = 32,
-    uploadSpeed = {},
-    lastUploadedSize = {},
-    lastSpeedUpdateTime = {};
-
-function getOptimalChunkSize(s) {
-    return Math.max(Math.ceil(s / 32), 20 * 1024 * 1024)
-}
+    selectedFiles = [];
 
 function getResourcesPerPage() {
     const w = window.innerWidth;
@@ -58,7 +49,6 @@ document.addEventListener('DOMContentLoaded', () => {
         currentPage = 1;
         loadResources()
     });
-    setTimeout(initResumableUpload, 500)
 });
 
 async function api(e, o = {}) {
@@ -380,45 +370,46 @@ async function startUpload() {
         toast('请选择文件', 'error');
         return
     }
-    closeUploadModal();
+    
     const desc = document.getElementById('uploadDesc').value;
+    
     for (const file of selectedFiles) {
         try {
-            await resumableUpload(file, desc)
-        } catch (e) {}
-    }
-    selectedFiles = [];
-    document.getElementById('fileList').innerHTML = '';
-    document.getElementById('uploadDesc').value = ''
-}
-
-function showGlobalProgress() {
-    const gp = document.getElementById('globalProgress');
-    if (!gp) return;
-    gp.style.display = 'block';
-    if (!document.getElementById('cleanupBtn')) {
-        const title = gp.querySelector('.progress-title');
-        if (title) {
-            const btn = document.createElement('button');
-            btn.id = 'cleanupBtn';
-            btn.className = 'btn btn-sm';
-            btn.innerHTML = '清理';
-            btn.onclick = cleanupCompletedTasks;
-            btn.style.marginLeft = '8px';
-            btn.style.fontSize = '.7rem';
-            btn.style.padding = '.2rem .4rem';
-            title.appendChild(btn)
+            await uploadFile(file, desc);
+        } catch (e) {
+            toast(`文件 ${file.name} 上传失败: ${e.message}`, 'error');
         }
     }
+    
+    selectedFiles = [];
+    document.getElementById('fileList').innerHTML = '';
+    document.getElementById('uploadDesc').value = '';
+    closeUploadModal();
+    loadResources();
+    loadStats();
 }
 
-function hideGlobalProgress() {
-    const gp = document.getElementById('globalProgress');
-    if (gp) {
-        gp.style.display = 'none';
-        const btn = document.getElementById('cleanupBtn');
-        if (btn) btn.remove()
+async function uploadFile(file, description = '') {
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('description', description);
+    
+    const response = await fetch(`${API}/upload`, {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${token}`
+        },
+        body: formData
+    });
+    
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({ error: '上传失败' }));
+        throw new Error(error.error || '上传失败');
     }
+    
+    const result = await response.json();
+    toast(`文件 ${file.name} 上传成功`);
+    return result;
 }
 
 async function loadStats() {
@@ -575,352 +566,6 @@ async function deleteAnnouncement(id) {
         toast(e.message, 'error')
     }
 }
-
-async function initResumableUpload() {
-    if (!token) return;
-    try {
-        const tasks = await api('/upload/tasks');
-        if (tasks?.length > 0) {
-            tasks.forEach(t => uploadTasks[t.id] = t);
-            showGlobalProgress();
-            updateAllTasksDisplay();
-            tasks.filter(t => !['completed', 'failed'].includes(t.status)).forEach(t => pollTaskStatus(t.id))
-        }
-    } catch (e) {}
-}
-
-// 格式化上传速度
-function formatSpeed(bytesPerSecond) {
-    if (bytesPerSecond < 1024) {
-        return bytesPerSecond.toFixed(0) + ' B/s';
-    } else if (bytesPerSecond < 1024 * 1024) {
-        return (bytesPerSecond / 1024).toFixed(1) + ' KB/s';
-    } else {
-        return (bytesPerSecond / (1024 * 1024)).toFixed(1) + ' MB/s';
-    }
-}
-
-// 更新上传速度
-function updateUploadSpeed(taskId, chunkSize, startTime) {
-    const now = Date.now();
-    const timeDiff = (now - startTime) / 1000; // 转换为秒
-    
-    if (timeDiff > 0) {
-        const instantSpeed = chunkSize / timeDiff; // 字节/秒
-        // 平滑速度计算（移动平均）
-        uploadSpeed[taskId] = uploadSpeed[taskId] * 0.7 + instantSpeed * 0.3;
-    }
-}
-
-async function resumableUpload(file, desc = '') {
-    const chunkSize = getOptimalChunkSize(file.size);
-    const init = await api('/upload/init', {
-        method: 'POST',
-        body: JSON.stringify({
-            file_name: file.name,
-            file_size: file.size,
-            chunk_size: chunkSize,
-            description: desc
-        })
-    });
-    const taskId = init.task_id;
-    
-    // 初始化上传速度统计
-    uploadSpeed[taskId] = 0;
-    lastUploadedSize[taskId] = 0;
-    lastSpeedUpdateTime[taskId] = Date.now();
-    
-    uploadTasks[taskId] = {
-        id: taskId,
-        file_name: file.name,
-        file_size: file.size,
-        total_chunks: init.total_chunks,
-        uploaded: [],
-        status: 'uploading',
-        progress: 0,
-        file: file,
-        chunk_size: chunkSize,
-        start_time: Date.now(),
-        chunk_progress: {},
-        uploaded_size: 0
-    };
-    
-    saveTaskMeta(taskId);
-    showGlobalProgress();
-    updateTaskDisplay(taskId);
-    await uploadAllChunks(taskId, file, init.total_chunks, chunkSize);
-    await api('/upload/complete', {
-        method: 'POST',
-        body: JSON.stringify({
-            task_id: taskId
-        })
-    });
-    pollTaskStatus(taskId);
-    return taskId;
-}
-
-async function uploadAllChunks(taskId, file, total, chunkSize) {
-    const task = uploadTasks[taskId];
-    const done = new Set(task.uploaded || []);
-    const pending = [];
-    
-    for (let i = 0; i < total; i++) {
-        if (!done.has(i)) pending.push(i);
-    }
-    
-    for (let i = 0; i < pending.length; i += FIXED_CONCURRENCY) {
-        const batch = pending.slice(i, i + FIXED_CONCURRENCY);
-        
-        // 检查是否暂停
-        if (!uploadTasks[taskId] || uploadTasks[taskId].status === 'paused') {
-            throw new Error('已暂停');
-        }
-        
-        await Promise.all(batch.map(async (idx) => {
-            if (!uploadTasks[taskId] || uploadTasks[taskId].status === 'paused') {
-                return;
-            }
-            
-            const start = idx * chunkSize;
-            const chunk = file.slice(start, Math.min(start + chunkSize, file.size));
-            
-            task.chunk_progress[idx] = {
-                status: 'uploading',
-                progress: 0
-            };
-            updateTaskDisplay(taskId);
-            
-            const chunkStartTime = Date.now();
-            await uploadChunkRetry(taskId, idx, chunk, 3);
-            
-            // 更新上传速度
-            const chunkSizeActual = chunk.size;
-            task.uploaded_size = (task.uploaded_size || 0) + chunkSizeActual;
-            updateUploadSpeed(taskId, chunkSizeActual, chunkStartTime);
-            
-            task.uploaded.push(idx);
-            task.chunk_progress[idx] = {
-                status: 'completed',
-                progress: 100
-            };
-            task.progress = Math.round(task.uploaded.length / total * 100);
-            updateTaskDisplay(taskId);
-        }));
-    }
-}
-
-async function uploadChunkRetry(taskId, idx, chunk, retries) {
-    for (let i = 0; i < retries; i++) {
-        try {
-            const fd = new FormData();
-            fd.append('task_id', taskId);
-            fd.append('chunk_index', idx);
-            fd.append('chunk', chunk);
-            const res = await fetch(`${API}/upload/chunk`, {
-                method: 'POST',
-                headers: {
-                    Authorization: `Bearer ${token}`
-                },
-                body: fd
-            });
-            if (!res.ok) throw new Error('上传失败');
-            return await res.json()
-        } catch (e) {
-            if (i === retries - 1) throw e;
-            await new Promise(r => setTimeout(r, 1000 * (i + 1)))
-        }
-    }
-}
-
-function pollTaskStatus(taskId) {
-    const check = async () => {
-        try {
-            const t = await api(`/upload/status/${taskId}`);
-            uploadTasks[taskId] = {
-                ...uploadTasks[taskId],
-                ...t
-            };
-            updateTaskDisplay(taskId);
-            if (t.status === 'completed') {
-                uploadTasks[taskId].completedTime = Date.now();
-                uploadTasks[taskId].progress = 100;
-                toast(`"${t.file_name}" 上传完成！`);
-                loadResources();
-                loadStats();
-                setTimeout(() => {
-                    if (uploadTasks[taskId]?.status === 'completed') {
-                        delete uploadTasks[taskId];
-                        clearTaskMeta(taskId);
-                        updateAllTasksDisplay()
-                    }
-                }, 3000);
-                return
-            }
-            if (t.status === 'failed') {
-                toast(`"${t.file_name}" 失败: ${t.error}`, 'error');
-                clearTaskMeta(taskId);
-                return
-            }
-            setTimeout(check, 1000)
-        } catch (e) {
-            setTimeout(check, 3000)
-        }
-    };
-    check()
-}
-
-function cleanupCompletedTasks() {
-    const completedIds = Object.keys(uploadTasks).filter(id => uploadTasks[id].status === 'completed');
-    completedIds.forEach(id => {
-        delete uploadTasks[id];
-        clearTaskMeta(id)
-    });
-    if (completedIds.length > 0) {
-        updateAllTasksDisplay();
-        toast(`已清理 ${completedIds.length} 个任务`)
-    } else toast('没有已完成任务')
-}
-
-// 暂停上传
-async function pauseUpload(taskId) {
-    try {
-        await api('/upload/pause', {
-            method: 'POST',
-            body: JSON.stringify({
-                task_id: taskId
-            })
-        });
-        uploadTasks[taskId].status = 'paused';
-        updateTaskDisplay(taskId);
-        toast('上传已暂停');
-    } catch (e) {
-        toast(e.message, 'error');
-    }
-}
-
-// 恢复上传
-async function resumeUpload(taskId) {
-    try {
-        await api('/upload/resume', {
-            method: 'POST',
-            body: JSON.stringify({
-                task_id: taskId
-            })
-        });
-        uploadTasks[taskId].status = 'uploading';
-        updateTaskDisplay(taskId);
-        
-        // 重新开始上传
-        const task = uploadTasks[taskId];
-        if (task?.file) {
-            const chunkSize = task.chunk_size || getOptimalChunkSize(task.file_size);
-            await uploadAllChunks(taskId, task.file, task.total_chunks, chunkSize);
-            await api('/upload/complete', {
-                method: 'POST',
-                body: JSON.stringify({
-                    task_id: taskId
-                })
-            });
-            pollTaskStatus(taskId);
-        }
-    } catch (e) {
-        toast(e.message, 'error');
-    }
-}
-
-async function cancelUpload(taskId) {
-    if (!confirm('确定取消？')) return;
-    try {
-        await api(`/upload/cancel/${taskId}`, {
-            method: 'DELETE'
-        });
-        delete uploadTasks[taskId];
-        clearTaskMeta(taskId);
-        updateAllTasksDisplay();
-        toast('已取消')
-    } catch (e) {
-        toast(e.message, 'error')
-    }
-}
-
-function formatTime(ms) {
-    const s = Math.floor(ms / 1000),
-        m = Math.floor(s / 60),
-        h = Math.floor(m / 60);
-    return h > 0 ? `${h}h${m%60}m` : m > 0 ? `${m}m${s%60}s` : `${s}s`
-}
-
-function updateTaskDisplay(taskId) {
-    const task = uploadTasks[taskId];
-    if (!task) return;
-    const list = document.getElementById('progressList');
-    if (!list) return;
-    let el = document.getElementById(`task-${taskId}`);
-    if (!el) {
-        el = document.createElement('div');
-        el.id = `task-${taskId}`;
-        el.className = 'progress-item';
-        list.appendChild(el)
-    }
-    const statusMap = {
-            pending: '准备中',
-            uploading: '上传中',
-            merging: '合并中',
-            processing: '处理中',
-            completed: '已完成',
-            failed: '失败',
-            paused: '已暂停'
-        },
-        cls = task.status === 'completed' ? 'progress-success' : task.status === 'failed' ? 'progress-error' : '',
-        elapsed = task.start_time ? `<span class="elapsed-time">⏱${formatTime(Date.now()-task.start_time)}</span>` : '',
-        // 添加上传速度显示
-        speed = task.status === 'uploading' ? `<span style="color: var(--primary); font-size: .7rem; margin-left: .5rem;">${formatSpeed(uploadSpeed[taskId] || 0)}</span>` : '';
-    
-    const chunkHtml = task.chunk_progress && Object.keys(task.chunk_progress).length > 0 ? `<div class="chunk-progress">${Object.entries(task.chunk_progress).slice(-5).map(([idx, cp]) => `<div class="chunk-item ${cp.status==='uploading'?'active':''}">块${parseInt(idx)+1}: ${cp.status==='completed'?'✓':cp.status}</div>`).join('')}</div>` : '';
-    
-    el.innerHTML = `<div class="progress-file-info"><span class="progress-file-name">${task.file_name}</span><span class="progress-file-size">${formatSize(task.file_size||0)}</span></div><div class="progress-bar"><div class="progress-fill" style="width:${task.progress}%"></div></div><div class="progress-status"><span class="${cls}">${statusMap[task.status]||task.status}${elapsed}${speed}</span><span class="progress-percent">${task.progress}%</span></div>${chunkHtml}<div style="margin-top:.3rem;display:flex;gap:.3rem">${task.status==='paused'?`<button class="btn btn-sm btn-primary" onclick="resumeUpload('${taskId}')">继续</button>`:task.status==='uploading'?`<button class="btn btn-sm btn-ghost" onclick="pauseUpload('${taskId}')">暂停</button>`:''}${!['completed','merging','processing'].includes(task.status)?`<button class="btn btn-sm btn-danger" onclick="cancelUpload('${taskId}')">取消</button>`:''}</div>`;
-}
-
-function updateAllTasksDisplay() {
-    const list = document.getElementById('progressList');
-    if (!list) return;
-    list.innerHTML = '';
-    const activeTasks = Object.keys(uploadTasks).filter(id => uploadTasks[id].status !== 'completed');
-    if (activeTasks.length === 0) {
-        hideGlobalProgress();
-        return
-    }
-    activeTasks.forEach(id => updateTaskDisplay(id))
-}
-
-function saveTaskMeta(taskId) {
-    const t = uploadTasks[taskId],
-        saved = JSON.parse(localStorage.getItem('uploadTasksMeta') || '{}');
-    saved[taskId] = {
-        id: t.id,
-        file_name: t.file_name,
-        file_size: t.file_size,
-        total_chunks: t.total_chunks,
-        chunk_size: t.chunk_size
-    };
-    localStorage.setItem('uploadTasksMeta', JSON.stringify(saved))
-}
-
-function clearTaskMeta(taskId) {
-    const saved = JSON.parse(localStorage.getItem('uploadTasksMeta') || '{}');
-    delete saved[taskId];
-    localStorage.setItem('uploadTasksMeta', JSON.stringify(saved))
-}
-
-setInterval(() => {
-    const now = Date.now(),
-        completed = Object.values(uploadTasks).filter(t => t.status === 'completed' && (now - (t.completedTime || now)) > 5000);
-    completed.forEach(task => {
-        delete uploadTasks[task.id];
-        clearTaskMeta(task.id)
-    });
-    if (completed.length > 0) updateAllTasksDisplay()
-}, 10000);
 </script>
 </body>
 </html>
