@@ -25,7 +25,12 @@ var db *sql.DB
 var jwtSecret = []byte("your-secret-key-change-in-production")
 var uploadDir = "./uploads"
 var chunkDir = "./chunks"
-
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
 type UploadTask struct {
 	ID          string `json:"id"`
 	UserID      int    `json:"user_id"`
@@ -408,7 +413,7 @@ func initDB() {
 	dbPassword := getEnv("DB_PASSWORD", "5210")  
 	dbName := getEnv("DB_NAME", "resource_share")
 	
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true&charset=utf8mb4",
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true&charset=utf8mb4&collation=utf8mb4_unicode_ci",
 		dbUser, dbPassword, dbHost, dbPort, dbName)
 	
 	db, err = sql.Open("mysql", dsn)

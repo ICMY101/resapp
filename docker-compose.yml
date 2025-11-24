@@ -35,16 +35,16 @@ services:
     networks:
       - app-network
 
-mysql:
-  image: mysql:8.0
-  environment:
-    - MYSQL_ROOT_PASSWORD=5210
-    - MYSQL_DATABASE=resource_share
-  volumes:
-    - mysql_data:/var/lib/mysql
-    - ./mysql/init.sql:/docker-entrypoint-initdb.d/init.sql  
-  networks:
-    - app-network
+  mysql:
+    image: mysql:8.0
+    environment:
+      - MYSQL_ROOT_PASSWORD=5210
+      - MYSQL_DATABASE=resource_share
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./mysql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - app-network
 
 volumes:
   mysql_data:
