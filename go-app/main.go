@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -25,6 +26,7 @@ var uploadDir = "./uploads"
 
 // 添加上传进度跟踪
 var uploadProgress = make(map[string]*UploadProgress)
+var progressMutex = &sync.RWMutex{}
 
 type UploadProgress struct {
 	TotalSize    int64     `json:"total_size"`
@@ -319,7 +321,10 @@ func handleUploadProgress(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	
+	progressMutex.RLock()
 	progress, exists := uploadProgress[uploadID]
+	progressMutex.RUnlock()
+	
 	if !exists {
 		http.Error(w, `{"error":"upload not found"}`, 404)
 		return
@@ -332,11 +337,16 @@ func handleUploadProgress(w http.ResponseWriter, r *http.Request) {
 		speed = float64(progress.Uploaded) / elapsed
 	}
 	
+	progressPercent := 0.0
+	if progress.TotalSize > 0 {
+		progressPercent = float64(progress.Uploaded) / float64(progress.TotalSize) * 100
+	}
+	
 	jsonResponse(w, map[string]interface{}{
 		"upload_id":    uploadID,
 		"total_size":   progress.TotalSize,
 		"uploaded":     progress.Uploaded,
-		"progress":     float64(progress.Uploaded) / float64(progress.TotalSize) * 100,
+		"progress":     progressPercent,
 		"speed":        speed,
 		"status":       progress.Status,
 		"file_name":    progress.FileName,
@@ -376,6 +386,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	defer file.Close()
 	
 	// 初始化上传进度
+	progressMutex.Lock()
 	uploadProgress[uploadID] = &UploadProgress{
 		TotalSize: header.Size,
 		Uploaded:  0,
@@ -383,6 +394,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		FileName:  header.Filename,
 		Status:    "uploading",
 	}
+	progressMutex.Unlock()
 	
 	// 生成唯一文件名
 	ext := filepath.Ext(header.Filename)
@@ -392,10 +404,11 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	// 创建目标文件
 	dst, err := os.Create(filePath)
 	if err != nil {
+		progressMutex.Lock()
 		uploadProgress[uploadID].Status = "error"
 		uploadProgress[uploadID].ErrorMessage = "创建文件失败"
+		progressMutex.Unlock()
 		http.Error(w, `{"error":"创建文件失败"}`, 500)
-		delete(uploadProgress, uploadID)
 		return
 	}
 	defer dst.Close()
@@ -404,9 +417,11 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	progressReader := &ProgressReader{
 		Reader: file,
 		OnProgress: func(read int64) {
+			progressMutex.Lock()
 			if progress, exists := uploadProgress[uploadID]; exists {
 				progress.Uploaded = read
 			}
+			progressMutex.Unlock()
 		},
 	}
 	
@@ -414,10 +429,11 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	written, err := io.Copy(dst, progressReader)
 	if err != nil {
 		os.Remove(filePath)
+		progressMutex.Lock()
 		uploadProgress[uploadID].Status = "error"
 		uploadProgress[uploadID].ErrorMessage = "保存文件失败"
+		progressMutex.Unlock()
 		http.Error(w, `{"error":"保存文件失败"}`, 500)
-		delete(uploadProgress, uploadID)
 		return
 	}
 	
@@ -435,15 +451,19 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	
 	if err != nil {
 		os.Remove(filePath)
+		progressMutex.Lock()
 		uploadProgress[uploadID].Status = "error"
 		uploadProgress[uploadID].ErrorMessage = "数据库写入失败"
+		progressMutex.Unlock()
 		http.Error(w, `{"error":"数据库写入失败"}`, 500)
-		delete(uploadProgress, uploadID)
 		return
 	}
 	
 	// 更新上传状态为完成
+	progressMutex.Lock()
 	uploadProgress[uploadID].Status = "completed"
+	uploadProgress[uploadID].Uploaded = written
+	progressMutex.Unlock()
 	
 	id, _ := res.LastInsertId()
 	jsonResponse(w, map[string]interface{}{
@@ -456,7 +476,9 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	// 清理进度数据（5分钟后）
 	go func() {
 		time.Sleep(5 * time.Minute)
+		progressMutex.Lock()
 		delete(uploadProgress, uploadID)
+		progressMutex.Unlock()
 	}()
 }
 
