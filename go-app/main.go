@@ -23,6 +23,18 @@ var db *sql.DB
 var jwtSecret = []byte("your-secret-key-change-in-production")
 var uploadDir = "./uploads"
 
+// 添加上传进度跟踪
+var uploadProgress = make(map[string]*UploadProgress)
+
+type UploadProgress struct {
+	TotalSize    int64     `json:"total_size"`
+	Uploaded     int64     `json:"uploaded"`
+	StartTime    time.Time `json:"start_time"`
+	FileName     string    `json:"file_name"`
+	Status       string    `json:"status"` // uploading, completed, error
+	ErrorMessage string    `json:"error_message,omitempty"`
+}
+
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
@@ -43,6 +55,7 @@ func main() {
 	http.HandleFunc("/api/resources", corsMiddleware(handleResources))
 	http.HandleFunc("/api/resources/", corsMiddleware(handleResourceOps))
 	http.HandleFunc("/api/upload", corsMiddleware(authMiddleware(handleUpload)))
+	http.HandleFunc("/api/upload/progress/", corsMiddleware(authMiddleware(handleUploadProgress)))
 	http.HandleFunc("/api/download/", corsMiddleware(handleDownload))
 	http.HandleFunc("/api/preview/", corsMiddleware(handlePreview))
 	http.HandleFunc("/api/categories", corsMiddleware(handleCategories))
@@ -294,19 +307,82 @@ func handleResourceOps(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// 添加上传进度查询接口
+func handleUploadProgress(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		return
+	}
+	
+	uploadID := strings.TrimPrefix(r.URL.Path, "/api/upload/progress/")
+	if uploadID == "" {
+		http.Error(w, `{"error":"upload ID required"}`, 400)
+		return
+	}
+	
+	progress, exists := uploadProgress[uploadID]
+	if !exists {
+		http.Error(w, `{"error":"upload not found"}`, 404)
+		return
+	}
+	
+	// 计算上传速度
+	elapsed := time.Since(progress.StartTime).Seconds()
+	var speed float64
+	if elapsed > 0 {
+		speed = float64(progress.Uploaded) / elapsed
+	}
+	
+	jsonResponse(w, map[string]interface{}{
+		"upload_id":    uploadID,
+		"total_size":   progress.TotalSize,
+		"uploaded":     progress.Uploaded,
+		"progress":     float64(progress.Uploaded) / float64(progress.TotalSize) * 100,
+		"speed":        speed,
+		"status":       progress.Status,
+		"file_name":    progress.FileName,
+		"error_message": progress.ErrorMessage,
+		"elapsed_time": elapsed,
+	})
+}
+
+// 修改上传处理函数，添加进度跟踪
 func handleUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		return
 	}
 	
-	// 增加文件大小限制 (100MB)
-	r.ParseMultipartForm(100 << 20)
+	// 生成上传ID用于进度跟踪
+	uploadID := uuid.New().String()
+	
+	// 限制文件大小为7GB
+	const maxUploadSize = 7 * 1024 * 1024 * 1024
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
+	
+	err := r.ParseMultipartForm(100 << 20) // 100MB内存缓存
+	if err != nil {
+		if strings.Contains(err.Error(), "request body too large") {
+			http.Error(w, `{"error":"文件大小超过7GB限制"}`, 400)
+			return
+		}
+		http.Error(w, `{"error":"读取文件失败"}`, 400)
+		return
+	}
+	
 	file, header, err := r.FormFile("file")
 	if err != nil {
 		http.Error(w, `{"error":"读取文件失败"}`, 400)
 		return
 	}
 	defer file.Close()
+	
+	// 初始化上传进度
+	uploadProgress[uploadID] = &UploadProgress{
+		TotalSize: header.Size,
+		Uploaded:  0,
+		StartTime: time.Now(),
+		FileName:  header.Filename,
+		Status:    "uploading",
+	}
 	
 	// 生成唯一文件名
 	ext := filepath.Ext(header.Filename)
@@ -316,16 +392,32 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	// 创建目标文件
 	dst, err := os.Create(filePath)
 	if err != nil {
+		uploadProgress[uploadID].Status = "error"
+		uploadProgress[uploadID].ErrorMessage = "创建文件失败"
 		http.Error(w, `{"error":"创建文件失败"}`, 500)
+		delete(uploadProgress, uploadID)
 		return
 	}
 	defer dst.Close()
 	
+	// 创建带进度跟踪的Reader
+	progressReader := &ProgressReader{
+		Reader: file,
+		OnProgress: func(read int64) {
+			if progress, exists := uploadProgress[uploadID]; exists {
+				progress.Uploaded = read
+			}
+		},
+	}
+	
 	// 复制文件内容
-	written, err := io.Copy(dst, file)
+	written, err := io.Copy(dst, progressReader)
 	if err != nil {
 		os.Remove(filePath)
+		uploadProgress[uploadID].Status = "error"
+		uploadProgress[uploadID].ErrorMessage = "保存文件失败"
 		http.Error(w, `{"error":"保存文件失败"}`, 500)
+		delete(uploadProgress, uploadID)
 		return
 	}
 	
@@ -343,12 +435,45 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	
 	if err != nil {
 		os.Remove(filePath)
+		uploadProgress[uploadID].Status = "error"
+		uploadProgress[uploadID].ErrorMessage = "数据库写入失败"
 		http.Error(w, `{"error":"数据库写入失败"}`, 500)
+		delete(uploadProgress, uploadID)
 		return
 	}
 	
+	// 更新上传状态为完成
+	uploadProgress[uploadID].Status = "completed"
+	
 	id, _ := res.LastInsertId()
-	jsonResponse(w, map[string]interface{}{"id": id, "category": cat, "message": "上传成功"})
+	jsonResponse(w, map[string]interface{}{
+		"id": id, 
+		"category": cat, 
+		"message": "上传成功",
+		"upload_id": uploadID,
+	})
+	
+	// 清理进度数据（5分钟后）
+	go func() {
+		time.Sleep(5 * time.Minute)
+		delete(uploadProgress, uploadID)
+	}()
+}
+
+// 进度跟踪Reader
+type ProgressReader struct {
+	Reader     io.Reader
+	OnProgress func(int64)
+	read       int64
+}
+
+func (pr *ProgressReader) Read(p []byte) (int, error) {
+	n, err := pr.Reader.Read(p)
+	pr.read += int64(n)
+	if pr.OnProgress != nil {
+		pr.OnProgress(pr.read)
+	}
+	return n, err
 }
 
 func handleDownload(w http.ResponseWriter, r *http.Request) {
