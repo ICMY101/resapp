@@ -376,7 +376,11 @@ func handleUploadProgress(w http.ResponseWriter, r *http.Request) {
 	}
 
 	uploadID := strings.TrimPrefix(r.URL.Path, "/api/upload/progress/")
+	fmt.Println("Progress query for uploadID:", uploadID)
+	
 	if uploadID == "" {
+		fmt.Println("uploadID is empty")
+		w.Header().Set("Content-Type", "application/json")
 		http.Error(w, `{"error":"upload ID required"}`, 400)
 		return
 	}
@@ -385,7 +389,10 @@ func handleUploadProgress(w http.ResponseWriter, r *http.Request) {
 	progress, exists := uploadProgress[uploadID]
 	progressMutex.RUnlock()
 
+	fmt.Println("Progress exists:", exists, "uploaded:", progress.Uploaded, "total:", progress.TotalSize)
+
 	if !exists {
+		w.Header().Set("Content-Type", "application/json")
 		http.Error(w, `{"error":"upload not found"}`, 404)
 		return
 	}
@@ -518,6 +525,8 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	uploadProgress[uploadID].Uploaded = written
 	progressMutex.Unlock()
 
+	fmt.Println("Upload completed, uploadID:", uploadID, "file:", header.Filename, "size:", written)
+	
 	id, _ := res.LastInsertId()
 	jsonResponse(w, map[string]interface{}{
 		"id":        id,
