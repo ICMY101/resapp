@@ -145,7 +145,9 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
+		w.Header().Set("Access-Control-Max-Age", "86400")
 		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
 			return
 		}
 		next(w, r)
@@ -154,6 +156,10 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 
 func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "OPTIONS" {
+			next(w, r)
+			return
+		}
 		auth := r.Header.Get("Authorization")
 		if !strings.HasPrefix(auth, "Bearer ") {
 			http.Error(w, `{"error":"unauthorized"}`, 401)
@@ -414,6 +420,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	fmt.Println("Upload request received from user:", r.Header.Get("X-User-ID"))
 	uploadID := uuid.New().String()
 	const maxUploadSize = 7 * 1024 * 1024 * 1024
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)

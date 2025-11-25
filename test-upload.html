@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>上传测试</title>
+</head>
+<body>
+    <h1>上传功能测试</h1>
+    <input type="file" id="testFile" />
+    <button onclick="testUpload()">测试上传</button>
+    <div id="result"></div>
+    <script>
+        const API = 'http://localhost:8080/api';
+        let token = localStorage.getItem('token');
+
+        async function testUpload() {
+            const fileInput = document.getElementById('testFile');
+            const file = fileInput.files[0];
+            
+            if (!file) {
+                alert('请选择文件');
+                return;
+            }
+
+            if (!token) {
+                alert('未登录，请先登录');
+                return;
+            }
+
+            console.log('开始测试上传...');
+            console.log('Token:', token);
+            console.log('文件:', file.name, file.size);
+
+            const formData = new FormData();
+            formData.append('file', file);
+            formData.append('description', '测试文件');
+
+            try {
+                console.log('发送请求到:', API + '/upload');
+                const response = await fetch(API + '/upload', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${token}`
+                    },
+                    body: formData
+                });
+
+                console.log('响应状态:', response.status);
+                console.log('响应头:', {
+                    'content-type': response.headers.get('content-type')
+                });
+
+                const data = await response.json();
+                console.log('响应数据:', data);
+
+                document.getElementById('result').innerHTML = `
+                    <h3>上传结果</h3>
+                    <pre>${JSON.stringify(data, null, 2)}</pre>
+                `;
+            } catch (error) {
+                console.error('错误:', error);
+                document.getElementById('result').innerHTML = `
+                    <h3>错误</h3>
+                    <pre>${error.message}</pre>
+                `;
+            }
+        }
+    </script>
+</body>
+</html>
