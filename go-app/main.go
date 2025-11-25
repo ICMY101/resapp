@@ -410,6 +410,7 @@ func handleUploadProgress(w http.ResponseWriter, r *http.Request) {
 
 func handleUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
+		http.Error(w, `{"error":"Method not allowed"}`, 405)
 		return
 	}
 
@@ -419,6 +420,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	err := r.ParseMultipartForm(100 << 20)
 	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
 		if strings.Contains(err.Error(), "request body too large") {
 			http.Error(w, `{"error":"文件大小超过7GB限制"}`, 400)
 			return
@@ -429,6 +431,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	file, header, err := r.FormFile("file")
 	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
 		http.Error(w, `{"error":"读取文件失败"}`, 400)
 		return
 	}
@@ -454,6 +457,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		uploadProgress[uploadID].Status = "error"
 		uploadProgress[uploadID].ErrorMessage = "创建文件失败"
 		progressMutex.Unlock()
+		w.Header().Set("Content-Type", "application/json")
 		http.Error(w, `{"error":"创建文件失败"}`, 500)
 		return
 	}
@@ -477,6 +481,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		uploadProgress[uploadID].Status = "error"
 		uploadProgress[uploadID].ErrorMessage = "保存文件失败"
 		progressMutex.Unlock()
+		w.Header().Set("Content-Type", "application/json")
 		http.Error(w, `{"error":"保存文件失败"}`, 500)
 		return
 	}
@@ -496,6 +501,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		uploadProgress[uploadID].Status = "error"
 		uploadProgress[uploadID].ErrorMessage = "数据库写入失败"
 		progressMutex.Unlock()
+		w.Header().Set("Content-Type", "application/json")
 		http.Error(w, `{"error":"数据库写入失败"}`, 500)
 		return
 	}
