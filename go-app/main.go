@@ -20,21 +20,43 @@ import (
 	"github.com/google/uuid"
 )
 
-var db *sql.DB
-var jwtSecret = []byte("your-secret-key-change-in-production")
-var uploadDir = "./uploads"
-
-// 添加上传进度跟踪
-var uploadProgress = make(map[string]*UploadProgress)
-var progressMutex = &sync.RWMutex{}
+var (
+	db             *sql.DB
+	jwtSecret      = []byte("your-secret-key-change-in-production")
+	uploadDir      = "./uploads"
+	uploadProgress = make(map[string]*UploadProgress)
+	progressMutex  = &sync.RWMutex{}
+)
 
 type UploadProgress struct {
 	TotalSize    int64     `json:"total_size"`
 	Uploaded     int64     `json:"uploaded"`
 	StartTime    time.Time `json:"start_time"`
 	FileName     string    `json:"file_name"`
-	Status       string    `json:"status"` // uploading, completed, error
+	Status       string    `json:"status"`
 	ErrorMessage string    `json:"error_message,omitempty"`
+}
+
+type User struct {
+	ID       int    `json:"id"`
+	Username string `json:"username"`
+	Role     string `json:"role"`
+	Created  string `json:"created"`
+}
+
+type ProgressReader struct {
+	Reader     io.Reader
+	OnProgress func(int64)
+	read       int64
+}
+
+func (pr *ProgressReader) Read(p []byte) (int, error) {
+	n, err := pr.Reader.Read(p)
+	pr.read += int64(n)
+	if pr.OnProgress != nil {
+		pr.OnProgress(pr.read)
+	}
+	return n, err
 }
 
 func getEnv(key, defaultValue string) string {
@@ -65,6 +87,7 @@ func main() {
 	http.HandleFunc("/api/announcements/", corsMiddleware(adminMiddleware(handleAnnouncementOps)))
 	http.HandleFunc("/api/stats", corsMiddleware(handleStats))
 
+	fmt.Println("Server starting on :8080")
 	http.ListenAndServe(":8080", nil)
 }
 
@@ -73,16 +96,24 @@ func initDB() {
 	dbHost := getEnv("DB_HOST", "mysql")
 	dbPort := getEnv("DB_PORT", "3306")
 	dbUser := getEnv("DB_USER", "root")
-	dbPassword := getEnv("DB_PASSWORD", "5210")  
+	dbPassword := getEnv("DB_PASSWORD", "5210")
 	dbName := getEnv("DB_NAME", "resource_share")
-	
+
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true&charset=utf8mb4&collation=utf8mb4_unicode_ci",
 		dbUser, dbPassword, dbHost, dbPort, dbName)
-	
+
 	db, err = sql.Open("mysql", dsn)
 	if err != nil {
+		fmt.Println("Database connection failed:", err)
 		os.Exit(1)
 	}
+
+	if err = db.Ping(); err != nil {
+		fmt.Println("Database ping failed:", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("Database connected successfully")
 }
 
 func hashPassword(p string) string {
@@ -91,13 +122,19 @@ func hashPassword(p string) string {
 }
 
 func generateToken(uid int, role string) (string, error) {
-	return jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{"user_id": uid, "role": role, "exp": time.Now().Add(24 * time.Hour).Unix()}).SignedString(jwtSecret)
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": uid,
+		"role":    role,
+		"exp":     time.Now().Add(24 * time.Hour).Unix(),
+	}).SignedString(jwtSecret)
 }
 
 func parseToken(s string) (int, string, error) {
-	t, err := jwt.Parse(s, func(*jwt.Token) (interface{}, error) { return jwtSecret, nil })
+	t, err := jwt.Parse(s, func(*jwt.Token) (interface{}, error) {
+		return jwtSecret, nil
+	})
 	if err != nil || !t.Valid {
-		return 0, "", fmt.Errorf("invalid")
+		return 0, "", fmt.Errorf("invalid token")
 	}
 	c := t.Claims.(jwt.MapClaims)
 	return int(c["user_id"].(float64)), c["role"].(string), nil
@@ -173,7 +210,8 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	var req struct{ Username, Password string }
 	json.NewDecoder(r.Body).Decode(&req)
 	var u User
-	err := db.QueryRow("SELECT id,username,role FROM users WHERE username=? AND password=?", req.Username, hashPassword(req.Password)).Scan(&u.ID, &u.Username, &u.Role)
+	err := db.QueryRow("SELECT id,username,role FROM users WHERE username=? AND password=?",
+		req.Username, hashPassword(req.Password)).Scan(&u.ID, &u.Username, &u.Role)
 	if err != nil {
 		http.Error(w, `{"error":"用户名或密码错误"}`, 401)
 		return
@@ -185,7 +223,8 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 func handleUser(w http.ResponseWriter, r *http.Request) {
 	uid, _ := strconv.Atoi(r.Header.Get("X-User-ID"))
 	var u User
-	db.QueryRow("SELECT id,username,role,created_at FROM users WHERE id=?", uid).Scan(&u.ID, &u.Username, &u.Role, &u.Created)
+	db.QueryRow("SELECT id,username,role,created_at FROM users WHERE id=?", uid).
+		Scan(&u.ID, &u.Username, &u.Role, &u.Created)
 	jsonResponse(w, u)
 }
 
@@ -206,7 +245,8 @@ func handleUsers(w http.ResponseWriter, r *http.Request) {
 		if req.Role == "" {
 			req.Role = "user"
 		}
-		db.Exec("INSERT INTO users (username,password,role) VALUES (?,?,?)", req.Username, hashPassword(req.Password), req.Role)
+		db.Exec("INSERT INTO users (username,password,role) VALUES (?,?,?)",
+			req.Username, hashPassword(req.Password), req.Role)
 		jsonResponse(w, map[string]string{"message": "创建成功"})
 	}
 }
@@ -217,7 +257,8 @@ func handleUserOps(w http.ResponseWriter, r *http.Request) {
 		var req struct{ Username, Password, Role string }
 		json.NewDecoder(r.Body).Decode(&req)
 		if req.Password != "" {
-			db.Exec("UPDATE users SET username=?,password=?,role=? WHERE id=?", req.Username, hashPassword(req.Password), req.Role, id)
+			db.Exec("UPDATE users SET username=?,password=?,role=? WHERE id=?",
+				req.Username, hashPassword(req.Password), req.Role, id)
 		} else {
 			db.Exec("UPDATE users SET username=?,role=? WHERE id=?", req.Username, req.Role, id)
 		}
@@ -239,9 +280,13 @@ func handleResources(w http.ResponseWriter, r *http.Request) {
 	}
 	offset := (page - 1) * limit
 	cat, search := r.URL.Query().Get("category"), r.URL.Query().Get("search")
-	query := `SELECT r.id,r.name,r.orig_name,r.size,r.category,r.description,r.file_type,COALESCE(u.username,''),r.downloads,r.created_at FROM resources r LEFT JOIN users u ON r.uploader_id=u.id WHERE 1=1`
+
+	query := `SELECT r.id,r.name,r.orig_name,r.size,r.category,r.description,r.file_type,
+		COALESCE(u.username,''),r.downloads,r.created_at FROM resources r 
+		LEFT JOIN users u ON r.uploader_id=u.id WHERE 1=1`
 	countQ := "SELECT COUNT(*) FROM resources r WHERE 1=1"
 	var args []interface{}
+
 	if cat != "" && cat != "全部" {
 		query += " AND r.category=?"
 		countQ += " AND category=?"
@@ -252,12 +297,15 @@ func handleResources(w http.ResponseWriter, r *http.Request) {
 		countQ += " AND (orig_name LIKE ? OR description LIKE ?)"
 		args = append(args, "%"+search+"%", "%"+search+"%")
 	}
+
 	var total int
 	db.QueryRow(countQ, args...).Scan(&total)
+
 	query += " ORDER BY r.id DESC LIMIT ? OFFSET ?"
 	args = append(args, limit, offset)
 	rows, _ := db.Query(query, args...)
 	defer rows.Close()
+
 	var resources []map[string]interface{}
 	for rows.Next() {
 		var id, downloads int
@@ -270,20 +318,27 @@ func handleResources(w http.ResponseWriter, r *http.Request) {
 			"created": created, "preview": getPreviewType(ft),
 		})
 	}
+
 	pages := (total + limit - 1) / limit
 	if pages < 1 {
 		pages = 1
 	}
-	jsonResponse(w, map[string]interface{}{"resources": resources, "total": total, "page": page, "pages": pages})
+	jsonResponse(w, map[string]interface{}{
+		"resources": resources, "total": total, "page": page, "pages": pages,
+	})
 }
 
 func handleResourceOps(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/api/resources/")
+
 	if r.Method == "GET" {
 		var rid, downloads int
 		var name, origName, cat, desc, ft, uploader, created, fp string
 		var size int64
-		err := db.QueryRow(`SELECT r.id,r.name,r.orig_name,r.size,r.category,r.description,r.file_type,COALESCE(u.username,''),r.downloads,r.created_at,r.file_path FROM resources r LEFT JOIN users u ON r.uploader_id=u.id WHERE r.id=?`, id).Scan(&rid, &name, &origName, &size, &cat, &desc, &ft, &uploader, &downloads, &created, &fp)
+		err := db.QueryRow(`SELECT r.id,r.name,r.orig_name,r.size,r.category,r.description,
+			r.file_type,COALESCE(u.username,''),r.downloads,r.created_at,r.file_path 
+			FROM resources r LEFT JOIN users u ON r.uploader_id=u.id WHERE r.id=?`, id).
+			Scan(&rid, &name, &origName, &size, &cat, &desc, &ft, &uploader, &downloads, &created, &fp)
 		if err != nil {
 			http.Error(w, `{"error":"资源不存在"}`, 404)
 			return
@@ -293,12 +348,12 @@ func handleResourceOps(w http.ResponseWriter, r *http.Request) {
 			"description": desc, "file_type": ft, "uploader": uploader, "downloads": downloads,
 			"created": created, "preview": getPreviewType(ft),
 		})
-	}  else if r.Method == "PUT" {
-			var req struct{ Description string }
-			json.NewDecoder(r.Body).Decode(&req)
-			db.Exec("UPDATE resources SET description=? WHERE id=?", req.Description, id)
-			jsonResponse(w, map[string]string{"message": "更新成功"})
-		} else if r.Method == "DELETE" {
+	} else if r.Method == "PUT" {
+		var req struct{ Description string }
+		json.NewDecoder(r.Body).Decode(&req)
+		db.Exec("UPDATE resources SET description=? WHERE id=?", req.Description, id)
+		jsonResponse(w, map[string]string{"message": "更新成功"})
+	} else if r.Method == "DELETE" {
 		var fp string
 		db.QueryRow("SELECT file_path FROM resources WHERE id=?", id).Scan(&fp)
 		if fp != "" {
@@ -309,66 +364,60 @@ func handleResourceOps(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// 添加上传进度查询接口
 func handleUploadProgress(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		return
 	}
-	
+
 	uploadID := strings.TrimPrefix(r.URL.Path, "/api/upload/progress/")
 	if uploadID == "" {
 		http.Error(w, `{"error":"upload ID required"}`, 400)
 		return
 	}
-	
+
 	progressMutex.RLock()
 	progress, exists := uploadProgress[uploadID]
 	progressMutex.RUnlock()
-	
+
 	if !exists {
 		http.Error(w, `{"error":"upload not found"}`, 404)
 		return
 	}
-	
-	// 计算上传速度
+
 	elapsed := time.Since(progress.StartTime).Seconds()
 	var speed float64
 	if elapsed > 0 {
 		speed = float64(progress.Uploaded) / elapsed
 	}
-	
+
 	progressPercent := 0.0
 	if progress.TotalSize > 0 {
 		progressPercent = float64(progress.Uploaded) / float64(progress.TotalSize) * 100
 	}
-	
+
 	jsonResponse(w, map[string]interface{}{
-		"upload_id":    uploadID,
-		"total_size":   progress.TotalSize,
-		"uploaded":     progress.Uploaded,
-		"progress":     progressPercent,
-		"speed":        speed,
-		"status":       progress.Status,
-		"file_name":    progress.FileName,
-		"error_message": progress.ErrorMessage,
-		"elapsed_time": elapsed,
+		"upload_id":      uploadID,
+		"total_size":     progress.TotalSize,
+		"uploaded":       progress.Uploaded,
+		"progress":       progressPercent,
+		"speed":          speed,
+		"status":         progress.Status,
+		"file_name":      progress.FileName,
+		"error_message":  progress.ErrorMessage,
+		"elapsed_time":   elapsed,
 	})
 }
 
-// 修改上传处理函数，添加进度跟踪
 func handleUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		return
 	}
-	
-	// 生成上传ID用于进度跟踪
+
 	uploadID := uuid.New().String()
-	
-	// 限制文件大小为7GB
 	const maxUploadSize = 7 * 1024 * 1024 * 1024
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
-	
-	err := r.ParseMultipartForm(100 << 20) // 100MB内存缓存
+
+	err := r.ParseMultipartForm(100 << 20)
 	if err != nil {
 		if strings.Contains(err.Error(), "request body too large") {
 			http.Error(w, `{"error":"文件大小超过7GB限制"}`, 400)
@@ -377,15 +426,14 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"读取文件失败"}`, 400)
 		return
 	}
-	
+
 	file, header, err := r.FormFile("file")
 	if err != nil {
 		http.Error(w, `{"error":"读取文件失败"}`, 400)
 		return
 	}
 	defer file.Close()
-	
-	// 初始化上传进度
+
 	progressMutex.Lock()
 	uploadProgress[uploadID] = &UploadProgress{
 		TotalSize: header.Size,
@@ -395,13 +443,11 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		Status:    "uploading",
 	}
 	progressMutex.Unlock()
-	
-	// 生成唯一文件名
+
 	ext := filepath.Ext(header.Filename)
 	newName := uuid.New().String() + ext
 	filePath := filepath.Join(uploadDir, newName)
-	
-	// 创建目标文件
+
 	dst, err := os.Create(filePath)
 	if err != nil {
 		progressMutex.Lock()
@@ -412,8 +458,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer dst.Close()
-	
-	// 创建带进度跟踪的Reader
+
 	progressReader := &ProgressReader{
 		Reader: file,
 		OnProgress: func(read int64) {
@@ -424,8 +469,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 			progressMutex.Unlock()
 		},
 	}
-	
-	// 复制文件内容
+
 	written, err := io.Copy(dst, progressReader)
 	if err != nil {
 		os.Remove(filePath)
@@ -436,19 +480,16 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"保存文件失败"}`, 500)
 		return
 	}
-	
-	// 获取用户ID
+
 	uid, _ := strconv.Atoi(r.Header.Get("X-User-ID"))
-	
-	// 确定文件类型和分类
 	ft := getFileType(ext)
 	cat := getCategoryFromFileType(ft)
 	description := r.FormValue("description")
-	
-	// 保存到数据库
-	res, err := db.Exec(`INSERT INTO resources (name,orig_name,size,category,description,file_path,file_type,uploader_id) VALUES (?,?,?,?,?,?,?,?)`,
+
+	res, err := db.Exec(`INSERT INTO resources (name,orig_name,size,category,description,
+		file_path,file_type,uploader_id) VALUES (?,?,?,?,?,?,?,?)`,
 		newName, header.Filename, written, cat, description, filePath, ft, uid)
-	
+
 	if err != nil {
 		os.Remove(filePath)
 		progressMutex.Lock()
@@ -458,44 +499,26 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"数据库写入失败"}`, 500)
 		return
 	}
-	
-	// 更新上传状态为完成
+
 	progressMutex.Lock()
 	uploadProgress[uploadID].Status = "completed"
 	uploadProgress[uploadID].Uploaded = written
 	progressMutex.Unlock()
-	
+
 	id, _ := res.LastInsertId()
 	jsonResponse(w, map[string]interface{}{
-		"id": id, 
-		"category": cat, 
-		"message": "上传成功",
+		"id":        id,
+		"category":  cat,
+		"message":   "上传成功",
 		"upload_id": uploadID,
 	})
-	
-	// 清理进度数据（5分钟后）
+
 	go func() {
 		time.Sleep(5 * time.Minute)
 		progressMutex.Lock()
 		delete(uploadProgress, uploadID)
 		progressMutex.Unlock()
 	}()
-}
-
-// 进度跟踪Reader
-type ProgressReader struct {
-	Reader     io.Reader
-	OnProgress func(int64)
-	read       int64
-}
-
-func (pr *ProgressReader) Read(p []byte) (int, error) {
-	n, err := pr.Reader.Read(p)
-	pr.read += int64(n)
-	if pr.OnProgress != nil {
-		pr.OnProgress(pr.read)
-	}
-	return n, err
 }
 
 func handleDownload(w http.ResponseWriter, r *http.Request) {
@@ -535,7 +558,8 @@ func handlePreview(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleCategories(w http.ResponseWriter, r *http.Request) {
-	jsonResponse(w, []string{"全部", "图片", "视频", "音频", "文档", "压缩包", "软件", "代码", "电子书", "设计资源", "字体", "办公模板", "学习资料", "游戏", "其他"})
+	jsonResponse(w, []string{"全部", "图片", "视频", "音频", "文档", "压缩包", "软件",
+		"代码", "电子书", "设计资源", "字体", "办公模板", "学习资料", "游戏", "其他"})
 }
 
 func handleAnnouncements(w http.ResponseWriter, r *http.Request) {
@@ -547,7 +571,9 @@ func handleAnnouncements(w http.ResponseWriter, r *http.Request) {
 			var id int
 			var title, content, created string
 			rows.Scan(&id, &title, &content, &created)
-			anns = append(anns, map[string]interface{}{"id": id, "title": title, "content": content, "created": created})
+			anns = append(anns, map[string]interface{}{
+				"id": id, "title": title, "content": content, "created": created,
+			})
 		}
 		if anns == nil {
 			anns = []map[string]interface{}{}
@@ -572,9 +598,12 @@ func handleAnnouncementOps(w http.ResponseWriter, r *http.Request) {
 func handleStats(w http.ResponseWriter, r *http.Request) {
 	var files, users, downloads int
 	var size int64
-	db.QueryRow("SELECT COUNT(*),COALESCE(SUM(size),0),COALESCE(SUM(downloads),0) FROM resources").Scan(&files, &size, &downloads)
+	db.QueryRow("SELECT COUNT(*),COALESCE(SUM(size),0),COALESCE(SUM(downloads),0) FROM resources").
+		Scan(&files, &size, &downloads)
 	db.QueryRow("SELECT COUNT(*) FROM users").Scan(&users)
-	jsonResponse(w, map[string]interface{}{"files": files, "users": users, "downloads": downloads, "size": size})
+	jsonResponse(w, map[string]interface{}{
+		"files": files, "users": users, "downloads": downloads, "size": size,
+	})
 }
 
 func getFileType(ext string) string {
@@ -594,7 +623,8 @@ func getFileType(ext string) string {
 		return "archive"
 	case ".exe", ".msi", ".dmg", ".pkg", ".deb", ".apk":
 		return "software"
-	case ".go", ".py", ".js", ".java", ".c", ".cpp", ".h", ".cs", ".php", ".rb", ".html", ".css", ".json", ".xml", ".sql":
+	case ".go", ".py", ".js", ".java", ".c", ".cpp", ".h", ".cs", ".php", ".rb",
+		".html", ".css", ".json", ".xml", ".sql":
 		return "code"
 	case ".epub", ".mobi", ".azw":
 		return "ebook"
@@ -608,7 +638,11 @@ func getFileType(ext string) string {
 }
 
 func getCategoryFromFileType(ft string) string {
-	m := map[string]string{"image": "图片", "video": "视频", "audio": "音频", "pdf": "文档", "document": "文档", "archive": "压缩包", "software": "软件", "code": "代码", "ebook": "电子书", "design": "设计资源", "font": "字体"}
+	m := map[string]string{
+		"image": "图片", "video": "视频", "audio": "音频", "pdf": "文档",
+		"document": "文档", "archive": "压缩包", "software": "软件", "code": "代码",
+		"ebook": "电子书", "design": "设计资源", "font": "字体",
+	}
 	if c, ok := m[ft]; ok {
 		return c
 	}
@@ -622,11 +656,4 @@ func getPreviewType(ft string) string {
 	default:
 		return "none"
 	}
-}
-
-type User struct {
-	ID       int    `json:"id"`
-	Username string `json:"username"`
-	Role     string `json:"role"`
-	Created  string `json:"created"`
 }
